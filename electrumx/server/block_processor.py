@@ -18,6 +18,7 @@ from functools import partial
 from aiorpcx import TaskGroup, run_in_thread
 
 import electrumx
+import electrumx.server.env as env
 from electrumx.server.daemon import DaemonError
 from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
 from electrumx.lib.util import chunks, class_logger
