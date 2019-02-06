@@ -28,6 +28,7 @@ from aiorpcx import (
 import electrumx
 import electrumx.lib.text as text
 import electrumx.lib.util as util
+import electrumx.server.env as env
 from electrumx.lib.hash import (sha256, hash_to_hex_str, hex_str_to_hash,
                                 HASHX_LEN, Base58Error)
 from electrumx.lib.peer import Peer
