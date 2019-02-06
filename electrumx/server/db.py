@@ -666,7 +666,7 @@ class DB(object):
         hashX_pairs = await run_in_thread(lookup_hashXs)
         return await run_in_thread(lookup_utxos, hashX_pairs)
 
-VIPSTARCOINDB(DB)
+VIPSTARCOINDB(DB):
 
     DB_VERSIONS = [8]
 
