@@ -36,6 +36,7 @@ import struct
 from decimal import Decimal
 from hashlib import sha256
 from functools import partial
+import base64
 
 import electrumx.lib.util as util
 from electrumx.lib.hash import Base58, hash160, double_sha256, hash_to_hex_str
@@ -44,9 +45,11 @@ from electrumx.lib.script import ScriptPubKey, OpCodes
 import electrumx.lib.tx as lib_tx
 import electrumx.lib.tx_dash as lib_tx_dash
 import electrumx.server.block_processor as block_proc
+import electrumx.server.controller as control
+from electrumx.server.db import db
 import electrumx.server.daemon as daemon
-from electrumx.server.session import (ElectrumX, DashElectrumX,
-                                      SmartCashElectrumX, AuxPoWElectrumX)
+from electrumx.server.session import (ElectrumX, DashElectrumX, SmartCashElectrumX,
+                                      AuxPoWElectrumX, VIPSTARCOINElectrumX)
 
 
 Block = namedtuple("Block", "raw header transactions")
@@ -72,6 +75,8 @@ class Coin(object):
     DESERIALIZER = lib_tx.Deserializer
     DAEMON = daemon.Daemon
     BLOCK_PROCESSOR = block_proc.BlockProcessor
+    NOTIFICATION = control.Notifications
+    DBSELECT = db.DB
     HEADER_VALUES = ('version', 'prev_block_hash', 'merkle_root', 'timestamp',
                      'bits', 'nonce')
     HEADER_UNPACK = struct.Struct('< I 32s 32s I I I').unpack_from
@@ -290,7 +295,6 @@ class EquihashMixin(object):
         '''Return the block header bytes'''
         deserializer = cls.DESERIALIZER(block)
         return deserializer.read_header(height, cls.BASIC_HEADER_SIZE)
-
 
 class ScryptMixin(object):
 
@@ -2526,3 +2530,95 @@ class MyriadcoinTestnet(Myriadcoin):
     WIF_BYTE = bytes.fromhex("ef")
     GENESIS_HASH = ('0000017ce2a79c8bddafbbe47c004aa9'
                     '2b20678c354b34085f62b762084b9788')
+                    
+class VIPSTARCOIN(Coin):
+    NAME = "VIPSTARCOIN"
+    SHORTNAME = "VIPS"
+    NET = "mainnet"
+    XPUB_VERBYTES = bytes.fromhex("0488b21e")
+    XPRV_VERBYTES = bytes.fromhex("0488ade4")
+    P2PKH_VERBYTE = bytes.fromhex("46")
+    P2SH_VERBYTES = [bytes.fromhex("32")]
+    WIF_BYTE = bytes.fromhex("80")
+    GENESIS_HASH = ('0000d068e1d30f79fb64446137106be9'
+                    'c6ee69a6a722295c131506b1ee09b77c')
+    TX_COUNT = 803228
+    TX_COUNT_HEIGHT = 432514
+    TX_PER_BLOCK = 2
+    PEER_DEFAULT_PORTS = {'t': '50001', 's': '50002'}
+    PEERS = []
+    DAEMON = daemon.VIPSTARCOINDaemon
+    DESERIALIZER = lib_tx.DeserializerVIPSTARCOIN
+    SESSIONCLS = VIPSTARCOINElectrumX
+    NOTIFICATION = control.VIPSTARCOINNotifications
+    BLOCK_PROCESSOR = block_proc.VIPSTARCOINBlockProcessor
+    DBSELECT = db.VIPSTARCOINDB
+    BASIC_HEADER_SIZE = 180
+    HEADER_VALUES = ('version', 'prev_block_hash', 'merkle_root', 'timestamp', 'bits', 'nonce',
+                      'hash_state_root', 'hash_utxo_root', 'hash_prevout_stake', 'hash_prevout_n', 'sig')
+    HEADER_UNPACK = struct.Struct('< I 32s 32s I I I 32s 32s 32s I 32s').unpack_from
+    STATIC_BLOCK_HEADERS = False
+    RPC_PORT = 31916
+    CHUNK_SIZE = 1024
+
+    @classmethod
+    def hash160_contract_to_hashY(cls, hash160, contract_addr):
+        m = sha256()
+        m.update(hash160.encode())
+        m.update(contract_addr.encode())
+        return m.digest()
+
+    @classmethod
+    def block_header(cls, block, height):
+        '''Returns the block header given a block and its height.'''
+        deserializer = cls.DESERIALIZER(block, start=cls.BASIC_HEADER_SIZE)
+        sig_length = deserializer.read_varint()
+        return block[:deserializer.cursor + sig_length]
+
+    @classmethod
+    def electrum_header(cls, header, height):
+        h = dict(zip(cls.HEADER_VALUES, cls.HEADER_UNPACK(header)))
+        # Add the height that is not present in the header itself
+        h['block_height'] = height
+        # Convert bytes to str
+        h['prev_block_hash'] = hash_to_hex_str(h['prev_block_hash'])
+        h['merkle_root'] = hash_to_hex_str(h['merkle_root'])
+        h['hash_state_root'] = hash_to_hex_str(h['hash_state_root'])
+        h['hash_utxo_root'] = hash_to_hex_str(h['hash_utxo_root'])
+        h['hash_prevout_stake'] = hash_to_hex_str(h['hash_prevout_stake'])
+        h['sig'] = hash_to_hex_str(h['sig'])
+        return h
+
+    @classmethod
+    def hashX_from_script(cls, script):
+        '''Returns a hashX from a script, or None if the script is provably
+        unspendable so the output can be dropped.
+        '''
+        if script and script[0] == OpCodes.OP_RETURN:
+            return None
+
+        # VIPSTARCOIN: make p2pk and p2pkh the same hashX
+        if (len(script) == 35 and script[0] == 0x21 and script[1] in [2, 3]) \
+                or (len(script) == 67 and script[0] == 0x41 and script[1] in [4, 6, 7]) \
+                and script[-1] == OpCodes.OP_CHECKSIG:
+            pubkey = script[1:-1]
+            script = ScriptPubKey.P2PKH_script(hash160(pubkey))
+
+        return sha256(script).digest()[:HASHX_LEN]
+
+
+class VIPSTARCOINTestnet(VIPSTARCOIN):
+    NAME = "VIPSTARCOIN"
+    SHORTNAME = "TVIP"
+    NET = "testnet"
+    XPUB_VERBYTES = bytes.fromhex("043587CF")
+    XPRV_VERBYTES = bytes.fromhex("04358394")
+    GENESIS_HASH = ('0000e803ee215c0684ca0d2f9220594d'
+                    '3f828617972aad66feb2ba51f5e14222')
+    REORG_LIMIT = 8000
+    TX_COUNT = 0
+    TX_COUNT_HEIGHT = 0
+    TX_PER_BLOCK = 0
+    PEERS = []
+    PEER_DEFAULT_PORTS = {'t': '51001', 's': '51002'}
+    RPC_PORT = 32916

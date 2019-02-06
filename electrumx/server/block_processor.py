@@ -33,6 +33,9 @@ class Prefetcher(object):
         self.coin = coin
         self.blocks_event = blocks_event
         self.blocks = []
+        # Use eventlog coins
+        if issubclass(env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
+            self.raw_eventlogs = []
         self.caught_up = False
         # Access to fetched_height should be protected by the semaphore
         self.fetched_height = None
@@ -66,6 +69,13 @@ class Prefetcher(object):
         self.refill_event.set()
         return blocks
 
+    if issubclass(env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
+        def get_prefetched_raw_eventlogs(self):
+            '''Called by block processor when it is processing queued blocks.'''
+            raw_eventlogs = self.raw_eventlogs
+            self.raw_eventlogs = []
+            return raw_eventlogs
+
     async def reset_height(self, height):
         '''Reset to prefetch blocks from the block processor's height.
 
@@ -75,6 +85,9 @@ class Prefetcher(object):
         '''
         async with self.semaphore:
             self.blocks.clear()
+            # Use eventlog coins
+            if issubclass(env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
+                self.raw_eventlogs.clear()
             self.cache_size = 0
             self.fetched_height = height
             self.refill_event.set()
@@ -114,6 +127,10 @@ class Prefetcher(object):
                     self.logger.info('new block height {:,d} hash {}'
                                      .format(first + count-1, hex_hashes[-1]))
                 blocks = await daemon.raw_blocks(hex_hashes)
+                if issubclass(env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
+                    raw_eventlogs = await daemon.searchlogs(first, first+count)
+                    if raw_eventlogs is None:
+                        raw_eventlogs = []
 
                 assert count == len(blocks)
 
@@ -130,6 +147,8 @@ class Prefetcher(object):
                 else:
                     self.ave_size = (size + (10 - count) * self.ave_size) // 10
 
+                if issubclass(env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
+                    self.raw_eventlogs.extend(raw_eventlogs)
                 self.blocks.extend(blocks)
                 self.cache_size += size
                 self.fetched_height += count
@@ -807,3 +826,279 @@ class LTORBlockProcessor(BlockProcessor):
                     add_touched(cache_value[:-12])
 
         self.tx_count -= len(txs)
+
+class VIPSTARCOINBlockProcessor(BlockProcessor):
+
+    def __init__(self, env, db, daemon, notifications):
+        self.env = env
+        self.db = db
+        self.daemon = daemon
+        self.notifications = notifications
+
+        self.coin = env.coin
+        self.blocks_event = asyncio.Event()
+        self.prefetcher = Prefetcher(daemon, env.coin, self.blocks_event)
+        self.logger = class_logger(__name__, self.__class__.__name__)
+
+        # Meta
+        self.next_cache_check = 0
+        self.touched = set()
+        self.reorg_count = 0
+
+        # Caches of unflushed items.
+        self.headers = []
+        self.tx_hashes = []
+        self.undo_infos = []
+
+        # UTXO cache
+        self.utxo_cache = {}
+        self.db_deletes = []
+
+        # eventlog
+        self.eventlog_touched = set()
+
+        # If the lock is successfully acquired, in-memory chain state
+        # is consistent with self.height
+        self.state_lock = asyncio.Lock()
+
+    async def check_and_advance_blocks_eventlogs(self, raw_blocks, raw_eventlogs):
+        '''Process the list of raw blocks passed.  Detects and handles
+        reorgs.
+        '''
+        if not raw_blocks:
+            return
+        first = self.height + 1
+        blocks = [self.coin.block(raw_block, first + n)
+                  for n, raw_block in enumerate(raw_blocks)]
+        headers = [block.header for block in blocks]
+        hprevs = [self.coin.header_prevhash(h) for h in headers]
+        chain = [self.tip] + [self.coin.header_hash(h) for h in headers[:-1]]
+
+        if hprevs == chain:
+            start = time.time()
+            await self.run_in_thread_with_lock(self.advance_blocks_eventlogs, blocks, raw_eventlogs)
+            await self._maybe_flush()
+            if not self.db.first_sync:
+                s = '' if len(blocks) == 1 else 's'
+                self.logger.info('processed {:,d} block{} in {:.1f}s'
+                                 .format(len(blocks), s,
+                                         time.time() - start))
+            if self._caught_up_event.is_set():
+                await self.notifications.on_block(self.touched, self.eventlog_touched, self.height)
+            self.touched = set()
+            self.eventlog_touched = set()
+        elif hprevs[0] != chain[0]:
+            await self.reorg_chain()
+        else:
+            # It is probably possible but extremely rare that what
+            # bitcoind returns doesn't form a chain because it
+            # reorg-ed the chain as it was processing the batched
+            # block hash requests.  Should this happen it's simplest
+            # just to reset the prefetcher and try again.
+            self.logger.warning('daemon blocks do not form a chain; '
+                                'resetting the prefetcher')
+            await self.prefetcher.reset_height(self.height)
+
+    async def reorg_chain(self, count=None):
+        '''Handle a chain reorganisation.
+
+        Count is the number of blocks to simulate a reorg, or None for
+        a real reorg.'''
+        if count is None:
+            self.logger.info('chain reorg detected')
+        else:
+            self.logger.info(f'faking a reorg of {count:,d} blocks')
+        await self.flush(True)
+
+        async def get_raw_blocks(last_height, hex_hashes):
+            heights = range(last_height, last_height - len(hex_hashes), -1)
+            try:
+                blocks = [self.db.read_raw_block(height) for height in heights]
+                self.logger.info(f'read {len(blocks)} blocks from disk')
+                return blocks
+            except FileNotFoundError:
+                return await self.daemon.raw_blocks(hex_hashes)
+
+        def flush_backup():
+            # self.touched can include other addresses which is
+            # harmless, but remove None.
+            self.touched.discard(None)
+            self.eventlog_touched.discard(None)
+            self.db.flush_backup(self.flush_data(), self.touched, self.eventlog_touched)
+
+        start, last, hashes = await self.reorg_hashes(count)
+        # Reverse and convert to hex strings.
+        hashes = [hash_to_hex_str(hash) for hash in reversed(hashes)]
+        # get saved evntlog hashYs
+        if hashes:
+            eventlog_hashYs = reduce(operator.add, [self.db.get_block_hashYs(x) for x in hashes])
+        else:
+            eventlog_hashYs = []
+        self.logger.info('chain reorg eventlog_hashYs {} {}'.format(eventlog_hashYs, hashes))
+
+        for hex_hashes in chunks(hashes, 50):
+            raw_blocks = await get_raw_blocks(last, hex_hashes)
+            await self.run_in_thread_with_lock(self.backup_blocks_eventlogs, raw_blocks, eventlog_hashYs)
+            await self.run_in_thread_with_lock(flush_backup)
+            last -= len(raw_blocks)
+        await self.prefetcher.reset_height(self.height)
+
+    def advance_blocks_eventlogs(self, blocks, raw_eventlogs):
+        '''Synchronously advance the blocks.
+
+        It is already verified they correctly connect onto our tip.
+        '''
+        min_height = self.db.min_undo_height(self.daemon.cached_height())
+        height = self.height
+
+        eventlog_dict, hashY_dict = self.raw_eventlogs_to_dict(raw_eventlogs)
+        self.db.hashYs = hashY_dict  # no need to cache all hashYs, only need most recent
+
+        for block in blocks:
+            height += 1
+            undo_info = self.advance_txs(block.transactions, eventlog_dict)
+            if height >= min_height:
+                self.undo_infos.append((undo_info, height))
+                self.db.write_raw_block(block.raw, height)
+
+        headers = [block.header for block in blocks]
+        self.height = height
+        self.headers.extend(headers)
+        self.tip = self.coin.header_hash(headers[-1])
+
+    def advance_txs(self, txs, eventlog_dict):
+        self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
+
+        # Use local vars for speed in the loops
+        undo_info = []
+        tx_num = self.tx_count
+        script_hashX = self.coin.hashX_from_script
+        s_pack = pack
+        put_utxo = self.utxo_cache.__setitem__
+        spend_utxo = self.spend_utxo
+        undo_info_append = undo_info.append
+        update_touched = self.touched.update
+        hashXs_by_tx = []
+        append_hashXs = hashXs_by_tx.append
+
+        eventlog_touched = self.eventlog_touched
+        eventlogs = defaultdict(list)  # {b'hashY' => [array('I', [txnum, log_index]),]}
+
+        for tx, tx_hash in txs:
+            hashXs = []
+            append_hashX = hashXs.append
+            tx_numb = s_pack('<I', tx_num)
+
+            # eventlog
+            tx_hash_str = hash_to_hex_str(tx_hash)
+            datas = eventlog_dict.get(tx_hash_str, [])
+            for data in datas:
+                hashY, log_index = data
+                eventlogs[hashY].append(array.array('I', [tx_num, log_index]))
+                eventlog_touched.add(hashY)
+
+            # Spend the inputs
+            for txin in tx.inputs:
+                if txin.is_generation():
+                    continue
+                cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
+                undo_info_append(cache_value)
+                append_hashX(cache_value[:-12])
+
+            # Add the new UTXOs
+            for idx, txout in enumerate(tx.outputs):
+                # Get the hashX.  Ignore unspendable outputs
+                hashX = script_hashX(txout.pk_script)
+                if hashX:
+                    append_hashX(hashX)
+                    put_utxo(tx_hash + s_pack('<H', idx),
+                             hashX + tx_numb + s_pack('<Q', txout.value))
+
+            append_hashXs(hashXs)
+            update_touched(hashXs)
+            tx_num += 1
+
+        self.db.eventlog.add_unflushed(eventlogs)
+        self.db.history.add_unflushed(hashXs_by_tx, self.tx_count)
+
+        self.tx_count = tx_num
+        self.db.tx_counts.append(tx_num)
+
+        return undo_info
+
+    def backup_blocks_eventlogs(self, raw_blocks, eventlog_hashYs):
+        '''Backup the raw blocks and flush.
+
+        The blocks should be in order of decreasing height, starting at.
+        self.height.  A flush is performed once the blocks are backed up.
+        '''
+        self.db.assert_flushed(self.flush_data())
+        assert self.height >= len(raw_blocks)
+
+        self.eventlog_touched.update(eventlog_hashYs)
+
+        coin = self.coin
+        for raw_block in raw_blocks:
+            # Check and update self.tip
+            block = coin.block(raw_block, self.height)
+            header_hash = coin.header_hash(block.header)
+            if header_hash != self.tip:
+                raise ChainError('backup block {} not tip {} at height {:,d}'
+                                 .format(hash_to_hex_str(header_hash),
+                                         hash_to_hex_str(self.tip),
+                                         self.height))
+            self.tip = coin.header_prevhash(block.header)
+            self.backup_txs(block.transactions)
+            self.height -= 1
+            self.db.tx_counts.pop()
+
+        self.logger.info('backed up to height {:,d}'.format(self.height))
+
+    async def _process_prefetched_blocks(self):
+        '''Loop forever processing blocks as they arrive.'''
+        while True:
+            if self.height == self.daemon.cached_height():
+                if not self._caught_up_event.is_set():
+                    await self._first_caught_up()
+                    self._caught_up_event.set()
+            await self.blocks_event.wait()
+            self.blocks_event.clear()
+            if self.reorg_count:
+                await self.reorg_chain(self.reorg_count)
+                self.reorg_count = 0
+            else:
+                blocks = self.prefetcher.get_prefetched_blocks()
+                raw_eventlogs = self.prefetcher.get_prefetched_raw_eventlogs()
+                await self.check_and_advance_blocks_eventlogs(blocks, raw_eventlogs)
+
+    def raw_eventlogs_to_dict(self, raw_eventlogs):
+        hash160_contract_to_hashY = self.coin.hash160_contract_to_hashY
+        eventlog_dict = defaultdict(set)  # hashY => [(txid, log_index)]
+        hashY_dict = defaultdict(set)  # blockHash => [hashY, ]
+        for eventlog in raw_eventlogs:
+            block_hash = eventlog.get('blockHash')
+            txid = eventlog.get('transactionHash')
+            if not txid or not block_hash:
+                continue
+            for log_index, log in enumerate(eventlog.get('log', [])):
+                if not isinstance(log, dict):
+                    print('log not dict')
+                    continue
+                contract_addr = log.get('address')
+                if not contract_addr:
+                    continue
+                topic_itmes = log.get('topics', [])
+                if len(topic_itmes) < 1:
+                    continue
+                topic_name = topic_itmes[0]
+                for item in topic_itmes[1:]:
+                    # only want hash160 address
+                    if len(item) == 64 \
+                            and item.startswith('0'*24) \
+                            and not item.startswith('0'*48):
+                        hash160 = item[-40:]
+                        hashY = hash160_contract_to_hashY(hash160, contract_addr)
+                        key = hashY+topic_name.encode()
+                        eventlog_dict[txid].add((key, log_index))
+                        hashY_dict[block_hash].add(key)
+        return eventlog_dict, hashY_dict

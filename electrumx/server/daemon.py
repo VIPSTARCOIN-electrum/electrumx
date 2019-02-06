@@ -476,3 +476,24 @@ class SmartCashDaemon(Daemon):
     async def smartrewards(self, params):
         '''Return smartrewards data.'''
         return await self._send_single('smartrewards', params)
+
+class VIPSTARCOINDaemon(Daemon):
+
+    async def callcontract(self, address, data, sender):
+        return await self._send_single('callcontract', (address, data, sender))
+
+    async def searchlogs(self, from_block, to_block, addresses=None, topics=None, minconf=0):
+        self.logger.info('searchlogs {} {}'.format(from_block, to_block))
+        if not addresses:
+            addresses = {'addresses': []}
+        else:
+            addresses = {'addresses': addresses}
+        if not topics:
+            topics = {'topics': []}
+        else:
+            topics = {'topics': topics}
+        eventlogs = await self._send_single('searchlogs', (from_block, to_block, addresses, topics, minconf))
+        return eventlogs
+
+    async def gettransactionreceipt(self, txid):
+        return await self._send_single('gettransactionreceipt', (txid, ))

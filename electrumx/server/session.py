@@ -124,6 +124,9 @@ class SessionManager(object):
         self.cur_group = SessionGroup(0)
         self.txs_sent = 0
         self.start_time = time.time()
+        # Use eventlog coins
+        if issubclass(env.coin.SESSIONCLS, VIPSTARCOINElectrumX):
+            self.eventlog_cache = pylru.lrucache(256)  # { hashY => [txnum, log_index] }
         self.history_cache = pylru.lrucache(256)
         self.notified_height = None
         # Cache some idea of room to avoid recounting on each subscription
@@ -335,14 +338,24 @@ class SessionManager(object):
                            ])
         return result
 
+    if issubclass(env.coin.SESSIONCLS, VIPSTARCOINElectrumX):
+        async def _electrum_and_raw_headers(self, height):
+            raw_header = await self.raw_header(height)
+            electrum_header = self.env.coin.electrum_header(raw_header, height)
+            return electrum_header, raw_header
+
     async def _refresh_hsub_results(self, height):
         '''Refresh the cached header subscription responses to be for height,
         and record that as notified_height.
         '''
         # Paranoia: a reorg could race and leave db_height lower
         height = min(height, self.db.db_height)
-        raw = await self.raw_header(height)
-        self.hsub_results = {'hex': raw.hex(), 'height': height}
+        if issubclass(env.coin.SESSIONCLS, VIPSTARCOINElectrumX):
+            electrum, raw = await self._electrum_and_raw_headers(height)
+            self.hsub_results = (electrum, {'hex': raw.hex(), 'height': height})
+        else:
+            raw = await self.raw_header(height)
+            self.hsub_results = {'hex': raw.hex(), 'height': height}
         self.notified_height = height
 
     # --- LocalRPC command handlers
@@ -530,6 +543,12 @@ class SessionManager(object):
             raise RPCError(BAD_REQUEST, f'height {height:,d} '
                            'out of range') from None
 
+    if issubclass(env.coin.SESSIONCLS, VIPSTARCOINElectrumX):
+        async def electrum_header(self, height):
+            '''Return the deserialized header at the given height.'''
+            electrum_header, _ = await self._electrum_and_raw_headers(height)
+            return electrum_header
+
     async def broadcast_transaction(self, raw_tx):
         hex_hash = await self.daemon.broadcast_transaction(raw_tx)
         self.txs_sent += 1
@@ -547,18 +566,36 @@ class SessionManager(object):
             hc[hashX] = await self.db.limited_history(hashX, limit=limit)
         return hc[hashX]
 
-    async def _notify_sessions(self, height, touched):
-        '''Notify sessions about height changes and touched addresses.'''
-        height_changed = height != self.notified_height
-        if height_changed:
-            await self._refresh_hsub_results(height)
-            # Invalidate our history cache for touched hashXs
-            hc = self.history_cache
-            for hashX in set(hc).intersection(touched):
-                del hc[hashX]
+    if issubclass(env.coin.SESSIONCLS, VIPSTARCOINElectrumX):
+        async def _notify_sessions(self, height, touched, eventlog_touched=None):
+            '''Notify sessions about height changes and touched addresses.'''
+            height_changed = height != self.notified_height
+            if height_changed:
+                await self._refresh_hsub_results(height)
+                # Invalidate our history cache for touched hashXs
+                hc = self.history_cache
+                for hashX in set(hc).intersection(touched):
+                    del hc[hashX]
+                ec = self.eventlog_cache
+                if eventlog_touched is not None:
+                    for hashY in set(ec).intersection(eventlog_touched):
+                        del ec[hashY]
 
-        for session in self.sessions:
-            await session.spawn(session.notify, touched, height_changed)
+            for session in self.sessions:
+                await session.spawn(session.notify, touched, eventlog_touched, height_changed)
+    else:
+        async def _notify_sessions(self, height, touched):
+            '''Notify sessions about height changes and touched addresses.'''
+            height_changed = height != self.notified_height
+            if height_changed:
+                await self._refresh_hsub_results(height)
+                # Invalidate our history cache for touched hashXs
+                hc = self.history_cache
+                for hashX in set(hc).intersection(touched):
+                    del hc[hashX]
+
+            for session in self.sessions:
+                await session.spawn(session.notify, touched, height_changed)
 
     def add_session(self, session):
         self.sessions.add(session)
@@ -581,6 +618,18 @@ class SessionManager(object):
                                f'{self.max_subs:,d} reached')
         self.subs_room -= 1
 
+    if issubclass(env.coin.SESSIONCLS, VIPSTARCOINElectrumX):
+        async def limited_eventlog(self, hashY):
+            '''A caching layer.'''
+            ec = self.eventlog_cache
+            if hashY not in ec:
+                # History DoS limit.  Each element of history is about 99
+                # bytes when encoded as JSON.  This limits resource usage
+                # on bloated history requests, and uses a smaller divisor
+                # so large requests are logged before refusing them.
+                limit = self.env.max_send // 97
+                ec[hashY] = await self.db.limited_eventlog(hashY, limit=limit)
+            return ec[hashY]
 
 class SessionBase(RPCSession):
     '''Base class of ElectrumX JSON sessions.
@@ -613,8 +662,12 @@ class SessionBase(RPCSession):
         self._receive_message_orig = self.connection.receive_message
         self.connection.receive_message = self.receive_message
 
-    async def notify(self, touched, height_changed):
-        pass
+    if issubclass(env.coin.SESSIONCLS, VIPSTARCOINElectrumX):
+        async def notify(self, touched, eventlog_touched, height_changed):
+            pass
+    else:
+        async def notify(self, touched, height_changed):
+            pass
 
     def peer_address_str(self, *, for_log=True):
         '''Returns the peer's IP address and port as a human-readable
@@ -1438,3 +1491,192 @@ class AuxPoWElectrumX(ElectrumX):
             height += 1
 
         return headers.hex()
+
+class VIPSTARCOINElectrumX(ElectrumX):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.subscribe_headers = False
+        self.subscribe_headers_raw = False
+        self.connection.max_response_size = self.env.max_send
+        self.max_subs = self.env.max_session_subs
+        self.hashX_subs = {}
+        self.sv_seen = False
+        self.mempool_statuses = {}
+        self.set_request_handlers(self.PROTOCOL_MIN)
+        self.contract_subs = {}  # hashY+topic_name: (hash160, contract_addr, topic)
+
+    async def notify(self, touched, eventlog_touched, height_changed):
+        super().notify(touched, height_changed)
+        if eventlog_touched:
+            matched = eventlog_touched.intersection(self.contract_subs)
+            if matched:
+                for hashY in matched:
+                    hash160, contract_addr, topic = self.contract_subs[hashY]
+                    contract_status = await self.hash160_contract_status(hash160, contract_addr, topic)
+                    method = 'blockchain.contract.event.subscribe'
+                    await self.send_notification(method, (hash160, contract_addr, topic, contract_status))
+
+    async def subscribe_headers_result(self):
+        '''The result of a header subscription or notification.'''
+        return self.session_mgr.hsub_results[self.subscribe_headers_raw]
+
+    async def _headers_subscribe(self, raw):
+        '''Subscribe to get headers of new blocks.'''
+        self.subscribe_headers_raw = assert_boolean(raw)
+        self.subscribe_headers = True
+        return await self.subscribe_headers_result()
+
+    async def headers_subscribe(self):
+        '''Subscribe to get raw headers of new blocks.'''
+        return await self._headers_subscribe(True)
+
+    async def headers_subscribe_True(self, raw=True):
+        '''Subscribe to get headers of new blocks.'''
+        return await self._headers_subscribe(raw)
+
+    async def headers_subscribe_False(self, raw=False):
+        '''Subscribe to get headers of new blocks.'''
+        return await self._headers_subscribe(raw)
+
+    def address_to_hashX(self, address):
+        try:
+            return self.coin.address_to_hashX(address)
+        except Exception:
+            pass
+        raise RPCError(BAD_REQUEST, f'{address} is not a valid address')
+
+    async def address_get_balance(self, address):
+        '''Return the confirmed and unconfirmed balance of an address.'''
+        hashX = self.address_to_hashX(address)
+        return await self.get_balance(hashX)
+
+    async def address_get_history(self, address):
+        '''Return the confirmed and unconfirmed history of an address.'''
+        hashX = self.address_to_hashX(address)
+        return await self.confirmed_and_unconfirmed_history(hashX)
+
+    async def address_get_mempool(self, address):
+        '''Return the mempool transactions touching an address.'''
+        hashX = self.address_to_hashX(address)
+        return await self.unconfirmed_history(hashX)
+
+    async def address_listunspent(self, address):
+        '''Return the list of UTXOs of an address.'''
+        hashX = self.address_to_hashX(address)
+        return await self.hashX_listunspent(hashX)
+
+    async def address_subscribe(self, address):
+        '''Subscribe to an address.
+
+        address: the address to subscribe to'''
+        hashX = self.address_to_hashX(address)
+        return await self.hashX_subscribe(hashX, address)
+
+    async def block_get_chunk(self, index):
+        '''Return a chunk of block headers as a hexadecimal string.
+
+        index: the chunk index'''
+        index = non_negative_integer(index)
+        size = self.coin.CHUNK_SIZE
+        start_height = index * size
+        headers, _ = await self.db.read_headers(start_height, size)
+        return headers.hex()
+
+    async def block_get_header(self, height):
+        '''The deserialized header at a given height.
+
+        height: the header's height'''
+        height = non_negative_integer(height)
+        return await self.session_mgr.electrum_header(height)
+
+    async def contract_call(self, address, data, sender='', result_type=None):
+        result = await self.daemon_request('callcontract', address, data, sender)
+        if not result_type:
+            return result
+        else:
+            return util.parse_call_output(result, result_type)
+
+    async def transaction_get_receipt(self, txid):
+        return await self.daemon_request('gettransactionreceipt', txid)
+
+    async def token_get_info(self, token_address):
+        name = await self.contract_call(token_address, '06fdde03')
+        decimals = await self.contract_call(token_address, '313ce567')
+        total_supply = await self.contract_call(token_address, '18160ddd')
+        symbol = await self.contract_call(token_address, '95d89b41')
+        return {
+            'name': util.parse_call_output(name, 'str'),
+            'decimals': util.parse_call_output(decimals, 'int'),
+            'total_supply': util.parse_call_output(total_supply, 'int'),
+            'symbol': util.parse_call_output(symbol, 'str')
+        }
+
+    async def contract_event_get_history(self, hash160, contract_addr, topic):
+        hashY = self.coin.hash160_contract_to_hashY(hash160, contract_addr)
+        hashY = hashY + topic.encode()
+        eventlogs = await self.session_mgr.limited_eventlog(hashY)
+        conf = [{'tx_hash': hash_to_hex_str(tx_hash),
+                 'height': height,
+                 'log_index': log_index}
+                for tx_hash, height, log_index in eventlogs]
+        return conf
+
+    async def hash160_contract_status(self, hash160, contract_addr, topic):
+        eventlogs = await self.contract_event_get_history(hash160, contract_addr, topic)
+        status = ':'.join('{}:{:d}:{:d}'.format(
+            dic.get('tx_hash'),
+            int(dic.get('height')),
+            int(dic.get('log_index'))
+        )
+                         for dic in eventlogs)
+        if status:
+            status = sha256(status.encode('ascii')).hex()
+        else:
+            status = None
+        return status
+
+    async def contract_event_subscribe(self, hash160, contract_addr, topic):
+        if len(self.contract_subs) >= self.max_subs:
+            raise RPCError('your contract subscription limit {:,d} reached'
+                           .format(self.max_subs))
+        hashY = self.coin.hash160_contract_to_hashY(hash160, contract_addr)
+        hashY = hashY + topic.encode()
+        self.contract_subs[hashY] = (hash160, contract_addr, topic)
+        return await self.hash160_contract_status(hash160, contract_addr, topic)
+
+    def set_request_handlers(self, ptuple):
+        self.protocol_tuple = ptuple
+
+        handlers = {
+            'blockchain.block.header': self.block_header,
+            'blockchain.block.headers': self.block_headers,
+            'blockchain.estimatefee': self.estimatefee,
+            'blockchain.headers.subscribe': self.headers_subscribe,
+            'blockchain.relayfee': self.relayfee,
+            'blockchain.scripthash.get_balance': self.scripthash_get_balance,
+            'blockchain.scripthash.get_history': self.scripthash_get_history,
+            'blockchain.scripthash.get_mempool': self.scripthash_get_mempool,
+            'blockchain.scripthash.listunspent': self.scripthash_listunspent,
+            'blockchain.scripthash.subscribe': self.scripthash_subscribe,
+            'blockchain.transaction.broadcast': self.transaction_broadcast,
+            'blockchain.transaction.get': self.transaction_get,
+            'blockchain.transaction.get_merkle': self.transaction_merkle,
+            'blockchain.transaction.id_from_pos': self.transaction_id_from_pos,
+            'mempool.get_fee_histogram': self.mempool.compact_fee_histogram,
+            'server.add_peer': self.add_peer,
+            'server.banner': self.banner,
+            'server.donation_address': self.donation_address,
+            'server.features': self.server_features_async,
+            'server.peers.subscribe': self.peers_subscribe,
+            'server.ping': self.ping,
+            'server.version': self.server_version,
+            'blockchain.headers.subscribe': self.headers_subscribe_False,
+            'blockchain.contract.call': self.contract_call,
+            'blochchain.transaction.get_receipt': self.transaction_get_receipt,
+            'blockchain.token.get_info': self.token_get_info,
+            'blockchain.contract.event.subscribe': self.contract_event_subscribe,
+            'blockchain.contract.event.get_history': self.contract_event_get_history,
+        }
+
+        self.request_handlers = handlers

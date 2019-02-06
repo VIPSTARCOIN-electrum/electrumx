@@ -12,7 +12,6 @@ from aiorpcx import _version as aiorpcx_version, TaskGroup
 import electrumx
 from electrumx.lib.server_base import ServerBase
 from electrumx.lib.util import version_string
-from electrumx.server.db import DB
 from electrumx.server.mempool import MemPool, MemPoolAPI
 from electrumx.server.session import SessionManager
 
@@ -93,12 +92,13 @@ class Controller(ServerBase):
         self.logger.info(f'event loop policy: {env.loop_policy}')
         self.logger.info(f'reorg limit is {env.reorg_limit:,d} blocks')
 
-        notifications = Notifications()
+        notifications = env.coin.NOTIFICATION
         Daemon = env.coin.DAEMON
         BlockProcessor = env.coin.BLOCK_PROCESSOR
+        _DB = env.coin.DBSELECT
 
         daemon = Daemon(env.coin, env.daemon_url)
-        db = DB(env)
+        db = _DB(env)
         bp = BlockProcessor(env, db, daemon, notifications)
 
         # Set notifications up to implement the MemPoolAPI
@@ -132,3 +132,33 @@ class Controller(ServerBase):
             await group.spawn(session_mgr.serve(notifications, mempool_event))
             await group.spawn(bp.fetch_and_process_blocks(caught_up_event))
             await group.spawn(wait_for_catchup())
+
+class VIPSTARCOINNotifications(Notifications)
+
+    def __init__(self):
+        self._touched_mp = {}
+        self._touched_bp = {}
+        self._eventlog_touched = {}
+        self._highest_block = -1
+
+    async def _maybe_notify(self):
+        super()._maybe_notify()
+        if height in self._eventlog_touched:
+            eventlog_touched = self._eventlog_touched.pop(height)
+        else:
+            eventlog_touched = set()
+        await self.notify(height, touched, eventlog_touched)
+
+    async def notify(self, height, touched, eventlog_touched):
+        super().notify(height, touched)
+
+    async def start(self, height, notify_func):
+        self._highest_block = height
+        self.notify = notify_func
+        await self.notify(height, set(), set())
+
+    async def on_block(self, touched, eventlog_touched, height):
+        self._touched_bp[height] = touched
+        self._highest_block = height
+        self._eventlog_touched[height] = eventlog_touched
+        await self._maybe_notify()

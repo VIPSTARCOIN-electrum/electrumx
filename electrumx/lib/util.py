@@ -26,7 +26,7 @@
 
 '''Miscellaneous utility classes and functions.'''
 
-
+import binascii
 import array
 import inspect
 from ipaddress import ip_address
@@ -343,6 +343,23 @@ pack_be_uint32 = struct_be_I.pack
 pack_byte = structB.pack
 
 hex_to_bytes = bytes.fromhex
+
+
+TOKEN_TRANSFER_TOPIC = 'ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+
+
+def parse_call_output(result, _type):
+    output = result.get('executionResult', {}).get('output', '')
+    if not output:
+        return None
+    if 'str' in _type:
+        length = int(output[64:128], 16)
+        parsed = binascii.a2b_hex(output[128: 128+length*2]).decode()
+    elif 'int' in _type:
+        parsed = int(output, 16)
+    else:
+        parsed = None
+    return parsed
 
 
 def pack_varint(n):

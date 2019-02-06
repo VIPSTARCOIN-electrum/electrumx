@@ -17,6 +17,7 @@ from bisect import bisect_right
 from collections import namedtuple
 from glob import glob
 from struct import pack, unpack
+from collections import defaultdict
 
 import attr
 from aiorpcx import run_in_thread, sleep
@@ -27,6 +28,7 @@ from electrumx.lib.merkle import Merkle, MerkleCache
 from electrumx.lib.util import formatted_time
 from electrumx.server.storage import db_class
 from electrumx.server.history import History
+from electrumx.server.eventlog import Eventlog
 
 
 UTXO = namedtuple("UTXO", "tx_num tx_pos tx_hash height value")
@@ -663,3 +665,204 @@ class DB(object):
 
         hashX_pairs = await run_in_thread(lookup_hashXs)
         return await run_in_thread(lookup_utxos, hashX_pairs)
+
+VIPSTARCOINDB(DB)
+
+    DB_VERSIONS = [8]
+
+    def __init__(self, env):
+        self.logger = util.class_logger(__name__, self.__class__.__name__)
+        self.env = env
+        self.coin = env.coin
+
+        # Setup block header size handlers
+        if self.coin.STATIC_BLOCK_HEADERS:
+            self.header_offset = self.coin.static_header_offset
+            self.header_len = self.coin.static_header_len
+        else:
+            self.header_offset = self.dynamic_header_offset
+            self.header_len = self.dynamic_header_len
+
+        self.logger.info(f'switching current directory to {env.db_dir}')
+        os.chdir(env.db_dir)
+
+        self.db_class = db_class(self.env.db_engine)
+        self.history = History()
+        self.eventlog = Eventlog()
+        self.unflushed_hashYs = defaultdict(set)  # {blockHash => [hashY, ]}, for reorg_chain
+        self.hashY_db = None
+        self.utxo_db = None
+        self.tx_counts = None
+        self.last_flush = time.time()
+
+        self.logger.info(f'using {self.env.db_engine} for DB backend')
+
+        # Header merkle cache
+        self.merkle = Merkle()
+        self.header_mc = MerkleCache(self.merkle, self.fs_block_hashes)
+
+        self.headers_file = util.LogicalFile('meta/headers', 2, 16000000)
+        self.tx_counts_file = util.LogicalFile('meta/txcounts', 2, 2000000)
+        self.hashes_file = util.LogicalFile('meta/hashes', 4, 16000000)
+        if not self.coin.STATIC_BLOCK_HEADERS:
+            self.headers_offsets_file = util.LogicalFile(
+                'meta/headers_offsets', 2, 16000000)
+
+    async def _open_dbs(self, for_sync, compacting):
+        assert self.utxo_db is None
+
+        # First UTXO DB
+        self.utxo_db = self.db_class('utxo', for_sync)
+        if self.utxo_db.is_new:
+            self.logger.info('created new database')
+            self.logger.info('creating metadata directory')
+            os.mkdir('meta')
+            with util.open_file('COIN', create=True) as f:
+                f.write(f'ElectrumX databases and metadata for '
+                        f'{self.coin.NAME} {self.coin.NET}'.encode())
+            if not self.coin.STATIC_BLOCK_HEADERS:
+                self.headers_offsets_file.write(0, bytes(8))
+        else:
+            self.logger.info(f'opened UTXO DB (for sync: {for_sync})')
+        self.read_utxo_state()
+
+        # Then history DB
+        self.utxo_flush_count = self.history.open_db(self.db_class, for_sync,
+                                                     self.utxo_flush_count,
+                                                     compacting)
+
+        # hashY and eventlog
+        self.hashY_db = self.db_class('hashY', for_sync)
+        self.eventlog.open_db(self.db_class, for_sync, self.utxo_flush_count, compacting)
+
+        self.clear_excess_undo_info()
+
+        # Read TX counts (requires meta directory)
+        await self._read_tx_counts()
+
+    async def open_for_serving(self):
+        '''Open the databases for serving.  If they are already open they are
+        closed first.
+        '''
+        if self.utxo_db:
+            self.logger.info('closing DBs to re-open for serving')
+            self.utxo_db.close()
+            self.history.close_db()
+            self.utxo_db = None
+            self.eventlog.close_db()
+        if self.hashY_db:
+            self.hashY_db.close()
+            self.hashY_db = None
+        await self._open_dbs(False, False)
+
+    # Flushing
+    def assert_flushed(self, flush_data):
+        '''Asserts state is fully flushed.'''
+        assert flush_data.tx_count == self.fs_tx_count == self.db_tx_count
+        assert flush_data.height == self.fs_height == self.db_height
+        assert flush_data.tip == self.db_tip
+        assert not flush_data.headers
+        assert not flush_data.block_tx_hashes
+        assert not flush_data.adds
+        assert not flush_data.deletes
+        assert not flush_data.undo_infos
+        self.history.assert_flushed()
+        self.eventlog.assert_flushed()
+
+
+    def flush_dbs(self, flush_data, flush_utxos, estimate_txs_remaining):
+        '''Flush out cached state.  History is always flushed; UTXOs are
+        flushed if flush_utxos.'''
+        if flush_data.height == self.db_height:
+            self.assert_flushed(flush_data)
+            return
+
+        start_time = time.time()
+        prior_flush = self.last_flush
+        tx_delta = flush_data.tx_count - self.last_flush_tx_count
+
+        # Flush to file system
+        self.flush_fs(flush_data)
+
+        # Then history
+        self.flush_history()
+
+        # Eventlog
+        self.flush_eventlog()
+
+        # HashYs
+        self.flush_hashYs()
+
+        # Flush state last as it reads the wall time.
+        with self.utxo_db.write_batch() as batch:
+            if flush_utxos:
+                self.flush_utxo_db(batch, flush_data)
+            self.flush_state(batch)
+
+        # Update and put the wall time again - otherwise we drop the
+        # time it took to commit the batch
+        self.flush_state(self.utxo_db)
+
+        elapsed = self.last_flush - start_time
+        self.logger.info(f'flush #{self.history.flush_count:,d} took '
+                         f'{elapsed:.1f}s.  Height {flush_data.height:,d} '
+                         f'txs: {flush_data.tx_count:,d} ({tx_delta:+,d})')
+
+        # Catch-up stats
+        if self.utxo_db.for_sync:
+            flush_interval = self.last_flush - prior_flush
+            tx_per_sec_gen = int(flush_data.tx_count / self.wall_time)
+            tx_per_sec_last = 1 + int(tx_delta / flush_interval)
+            eta = estimate_txs_remaining() / tx_per_sec_last
+            self.logger.info(f'tx/sec since genesis: {tx_per_sec_gen:,d}, '
+                             f'since last flush: {tx_per_sec_last:,d}')
+            self.logger.info(f'sync time: {formatted_time(self.wall_time)}  '
+                             f'ETA: {formatted_time(eta)}')
+
+    def flush_eventlog(self):
+        self.eventlog.flush()
+
+    def flush_backup(self, flush_data, touched, eventlog_touched):
+        '''Like flush_dbs() but when backing up.  All UTXOs are flushed.'''
+        assert not flush_data.headers
+        assert not flush_data.block_tx_hashes
+        assert flush_data.height < self.db_height
+        self.history.assert_flushed()
+        self.eventlog.assert_flushed()
+
+        start_time = time.time()
+        tx_delta = flush_data.tx_count - self.last_flush_tx_count
+
+        self.backup_fs(flush_data.height, flush_data.tx_count)
+        self.history.backup(touched, flush_data.tx_count)
+        self.eventlog.backup(eventlog_touched, flush_data.tx_count)
+
+        with self.utxo_db.write_batch() as batch:
+            self.flush_utxo_db(batch, flush_data)
+            # Flush state last as it reads the wall time.
+            self.flush_state(batch)
+
+        elapsed = self.last_flush - start_time
+        self.logger.info(f'backup flush #{self.history.flush_count:,d} took '
+                         f'{elapsed:.1f}s.  Height {flush_data.height:,d} '
+                         f'txs: {flush_data.tx_count:,d} ({tx_delta:+,d})')
+
+    async def limited_eventlog(self, hashY, *, limit=1000):
+        '''Return an unpruned, sorted list of (tx_hash, height) tuples of
+        confirmed transactions that touched the address, earliest in
+        the blockchain first.  Includes both spending and receiving
+        transactions.  By default returns at most 1000 entries.  Set
+        limit to None to get them all.
+        '''
+        def read_eventlog():
+            datas = list(self.eventlog.get_txnums(hashY, limit))
+            fs_tx_hash = self.fs_tx_hash
+            return [fs_tx_hash(tx_num) + (log_index, ) for (tx_num, log_index) in datas]
+
+        while True:
+            history = await run_in_thread(read_eventlog)
+            if all(record is not None for record in history):
+                return history
+            self.logger.warning(f'limited_eventlog: tx hash '
+                                f'not found (reorg?), retrying...')
+            await sleep(0.25)

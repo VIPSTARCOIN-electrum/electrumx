@@ -797,3 +797,12 @@ class DeserializerBitcoinDiamondSegWit(DeserializerBitcoinDiamond,
         we process it in the natural serialized order.
         '''
         return self._read_tx_parts()[0]
+
+class DeserializerVIPSTARCOIN(DeserializerSegWit):
+
+    def read_varint(self):
+        '''
+        set _read_varint to public
+        :return: int
+        '''
+        return self._read_varint()
