@@ -17,10 +17,10 @@ from collections import defaultdict, Counter
 from aiorpcx import (Connector, RPCSession, SOCKSProxy,
                      Notification, handler_invocation,
                      SOCKSError, RPCError, TaskTimeout, TaskGroup, Event,
-                     sleep, run_in_thread, ignore_after, timeout_after)
+                     sleep, ignore_after, timeout_after)
 
 from electrumx.lib.peer import Peer
-from electrumx.lib.util import class_logger
+from electrumx.lib.util import class_logger, protocol_tuple
 
 PEER_GOOD, PEER_STALE, PEER_NEVER, PEER_BAD = range(4)
 STALE_SECS = 24 * 3600
@@ -152,22 +152,28 @@ class PeerManager(object):
             self.logger.info('no proxy detected, will try later')
             await sleep(900)
 
-    async def _note_peers(self, peers, limit=2, check_ports=False,
+    async def _note_peers(self, peers, limit=2, check_ports=False, check_matches=False,
                           source=None):
         '''Add a limited number of peers that are not already present.'''
         new_peers = []
+        known = []
         for peer in peers:
             if not peer.is_public or (peer.is_tor and not self.proxy):
                 continue
 
             matches = peer.matches(self.peers)
-            if not matches:
+            if matches:
+                known.append(peer)
+                if check_ports:
+                    for match in matches:
+                        if match.check_ports(peer):
+                            self.logger.info(f'ports changed for {peer}')
+                            match.retry_event.set()
+            else:
                 new_peers.append(peer)
-            elif check_ports:
-                for match in matches:
-                    if match.check_ports(peer):
-                        self.logger.info(f'ports changed for {peer}')
-                        match.retry_event.set()
+
+        if check_matches and len(self.peers) >= 6 and len(known) <= len(self.peers) // 2:
+            return False
 
         if new_peers:
             source = source or new_peers[0].source
@@ -181,6 +187,8 @@ class PeerManager(object):
                 peer.retry_event = Event()
                 self.peers.add(peer)
                 await self.group.spawn(self._monitor_peer(peer))
+
+        return True
 
     async def _monitor_peer(self, peer):
         # Stop monitoring if we were dropped (a duplicate peer)
@@ -289,29 +297,35 @@ class PeerManager(object):
         server_version, protocol_version = result
         peer.server_version = server_version
         peer.features['server_version'] = server_version
+        ptuple = protocol_tuple(protocol_version)
 
         async with TaskGroup() as g:
-            await g.spawn(self._send_headers_subscribe(session, peer))
+            await g.spawn(self._send_headers_subscribe(session, peer, ptuple))
             await g.spawn(self._send_server_features(session, peer))
             peers_task = await g.spawn(self._send_peers_subscribe
                                        (session, peer))
 
         # Process reported peers if remote peer is good
         peers = peers_task.result()
-        await self._note_peers(peers)
-        features = self._features_to_register(peer, peers)
-        if features:
-            self.logger.info(f'registering ourself with {peer}')
-            # We only care to wait for the response
-            await session.send_request('server.add_peer', [features])
+        if await self._note_peers(peers, check_matches=not peer.is_tor):
+            features = self._features_to_register(peer, peers)
+            if features:
+                self.logger.info(f'registering ourself with {peer}')
+                # We only care to wait for the response
+                await session.send_request('server.add_peer', [features])
+        else:
+            raise BadPeerError('potential sybil detected')
 
-    async def _send_headers_subscribe(self, session, peer):
+    async def _send_headers_subscribe(self, session, peer, ptuple):
         message = 'blockchain.headers.subscribe'
         result = await session.send_request(message)
         assert_good(message, result, dict)
 
         our_height = self.db.db_height
-        their_height = result.get('height')
+        if ptuple < (1, 3):
+            their_height = result.get('block_height')
+        else:
+            their_height = result.get('height')
         if not isinstance(their_height, int):
             raise BadPeerError(f'invalid height {their_height}')
         if abs(our_height - their_height) > 5:
@@ -321,13 +335,24 @@ class PeerManager(object):
         # Check prior header too in case of hard fork.
         check_height = min(our_height, their_height)
         raw_header = await self.db.raw_header(check_height)
-        ours = raw_header.hex()
-        message = 'blockchain.block.header'
-        theirs = await session.send_request(message, [check_height])
-        assert_good(message, theirs, str)
-        if ours != theirs:
-            raise BadPeerError(f'our header {ours} and '
-                               f'theirs {theirs} differ')
+        if ptuple >= (1, 4):
+            ours = raw_header.hex()
+            message = 'blockchain.block.header'
+            theirs = await session.send_request(message, [check_height])
+            assert_good(message, theirs, str)
+            if ours != theirs:
+                raise BadPeerError(f'our header {ours} and '
+                                   f'theirs {theirs} differ')
+        else:
+            ours = self.env.coin.electrum_header(raw_header, check_height)
+            ours = ours.get('prev_block_hash')
+            message = 'blockchain.block.get_header'
+            theirs = await session.send_request(message, [check_height])
+            assert_good(message, theirs, dict)
+            theirs = theirs.get('prev_block_hash')
+            if ours != theirs:
+                raise BadPeerError(f'our header hash {ours} and '
+                                   f'theirs {theirs} differ')
 
     async def _send_server_features(self, session, peer):
         message = 'server.features'
@@ -431,8 +456,7 @@ class PeerManager(object):
                 reason = 'source-destination mismatch'
 
         if permit:
-            self.logger.info(f'accepted add_peer request from {source} '
-                             f'for {host}')
+            self.logger.info(f'accepted add_peer request from {source} for {host}')
             await self._note_peers([peer], check_ports=True)
         else:
             self.logger.warning(f'rejected add_peer request from {source} '

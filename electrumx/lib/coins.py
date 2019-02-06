@@ -31,6 +31,7 @@ necessary for appropriate handling.
 '''
 
 from collections import namedtuple
+import base64
 import re
 import struct
 from decimal import Decimal
@@ -46,7 +47,7 @@ import electrumx.lib.tx as lib_tx
 import electrumx.lib.tx_dash as lib_tx_dash
 import electrumx.server.block_processor as block_proc
 import electrumx.server.controller as control
-from electrumx.server.db import db
+import electrumx.server.db as db
 import electrumx.server.daemon as daemon
 from electrumx.server.session import (ElectrumX, DashElectrumX, SmartCashElectrumX,
                                       AuxPoWElectrumX, VIPSTARCOINElectrumX)
@@ -260,6 +261,20 @@ class Coin(object):
         '''
         return Decimal(value) / cls.VALUE_PER_COIN
 
+    @classmethod
+    def electrum_header(cls, header, height):
+        h = dict(zip(cls.HEADER_VALUES, cls.HEADER_UNPACK(header)))
+        # Add the height that is not present in the header itself
+        h['block_height'] = height
+        # Convert bytes to str
+        h['prev_block_hash'] = hash_to_hex_str(h['prev_block_hash'])
+        h['merkle_root'] = hash_to_hex_str(h['merkle_root'])
+        return h
+
+    @classmethod
+    def upgrade_required(cls, client_ver):
+        return False
+
 
 class AuxPowMixin(object):
     STATIC_BLOCK_HEADERS = False
@@ -289,6 +304,18 @@ class EquihashMixin(object):
     HEADER_VALUES = ('version', 'prev_block_hash', 'merkle_root', 'reserved',
                      'timestamp', 'bits', 'nonce')
     HEADER_UNPACK = struct.Struct('< I 32s 32s 32s I I 32s').unpack_from
+
+    @classmethod
+    def electrum_header(cls, header, height):
+        h = dict(zip(cls.HEADER_VALUES, cls.HEADER_UNPACK(header)))
+        # Add the height that is not present in the header itself
+        h['block_height'] = height
+        # Convert bytes to str
+        h['prev_block_hash'] = hash_to_hex_str(h['prev_block_hash'])
+        h['merkle_root'] = hash_to_hex_str(h['merkle_root'])
+        h['reserved'] = hash_to_hex_str(h['reserved'])
+        h['nonce'] = hash_to_hex_str(h['nonce'])
+        return h
 
     @classmethod
     def block_header(cls, block, height):
@@ -380,6 +407,17 @@ class BitcoinCash(BitcoinMixin, Coin):
     ]
     BLOCK_PROCESSOR = block_proc.LTORBlockProcessor
 
+    @classmethod
+    def upgrade_required(cls, client_ver):
+        if client_ver < (3, 3, 4):
+            return ('<br/><br/>'
+                    'Your transaction was successfully broadcast.<br/><br/>'
+                    'However, you are using a VULNERABLE version of Electron Cash.<br/>'
+                    'Download the latest version from this web site ONLY:<br/>'
+                    'https://electroncash.org/'
+                    '<br/><br/>')
+        return False
+
 
 class BitcoinSegwit(BitcoinMixin, Coin):
     NAME = "BitcoinSegwit"
@@ -401,6 +439,17 @@ class BitcoinSegwit(BitcoinMixin, Coin):
         'node.arihanc.com s t',
         'arihancckjge66iv.onion s t',
     ]
+
+    @classmethod
+    def upgrade_required(cls, client_ver):
+        if client_ver < (3, 3, 3):
+            return ('<br/><br/>'
+                    'Your transaction was successfully broadcast.<br/><br/>'
+                    'However, you are using a VULNERABLE version of Electrum.<br/>'
+                    'Download the new version from the usual place:<br/>'
+                    'https://electrum.org/'
+                    '<br/><br/>')
+        return False
 
 
 class BitcoinGold(EquihashMixin, BitcoinMixin, Coin):
@@ -431,6 +480,13 @@ class BitcoinGold(EquihashMixin, BitcoinMixin, Coin):
             return double_sha256(header)
         else:
             return double_sha256(header[:68] + header[100:112])
+
+    @classmethod
+    def electrum_header(cls, header, height):
+        h = super().electrum_header(header, height)
+        h['reserved'] = hash_to_hex_str(header[72:100])
+        h['solution'] = hash_to_hex_str(header[140:])
+        return h
 
 
 class BitcoinGoldTestnet(BitcoinGold):
@@ -559,6 +615,17 @@ class BitcoinCashTestnet(BitcoinTestnetMixin, Coin):
     ]
     BLOCK_PROCESSOR = block_proc.LTORBlockProcessor
 
+    @classmethod
+    def upgrade_required(cls, client_ver):
+        if client_ver < (3, 3, 4):
+            return ('<br/><br/>'
+                    'Your transaction was successfully broadcast.<br/><br/>'
+                    'However, you are using a VULNERABLE version of Electron Cash.<br/>'
+                    'Download the latest version from this web site ONLY:<br/>'
+                    'https://electroncash.org/'
+                    '<br/><br/>')
+        return False
+
 
 class BitcoinSVRegtest(BitcoinSVTestnet):
     NET = "regtest"
@@ -582,6 +649,17 @@ class BitcoinSegwitTestnet(BitcoinTestnetMixin, Coin):
         'w3e2orjpiiv2qwem3dw66d7c4krink4nhttngkylglpqe5r22n6n5wid.onion s t',
         'testnet.qtornado.com s t',
     ]
+
+    @classmethod
+    def upgrade_required(cls, client_ver):
+        if client_ver < (3, 3, 3):
+            return ('<br/><br/>'
+                    'Your transaction was successfully broadcast.<br/><br/>'
+                    'However, you are using a VULNERABLE version of Electrum.<br/>'
+                    'Download the new version from the usual place:<br/>'
+                    'https://electrum.org/'
+                    '<br/><br/>')
+        return False
 
 
 class BitcoinSegwitRegtest(BitcoinSegwitTestnet):
@@ -1073,6 +1151,12 @@ class FairCoin(Coin):
         else:
             return Block(raw_block, cls.block_header(raw_block, height), [])
 
+    @classmethod
+    def electrum_header(cls, header, height):
+        h = super().electrum_header(header, height)
+        h['payload_hash'] = hash_to_hex_str(h['payload_hash'])
+        return h
+
 
 class Zcash(EquihashMixin, Coin):
     NAME = "Zcash"
@@ -1121,6 +1205,13 @@ class SnowGem(EquihashMixin, Coin):
     RPC_PORT = 16112
     REORG_LIMIT = 800
     CHUNK_SIZE = 200
+
+    @classmethod
+    def electrum_header(cls, header, height):
+        h = super().electrum_header(header, height)
+        h['n_solution'] = base64.b64encode(lib_tx.Deserializer(
+            header, start=140)._read_varbytes()).decode('utf8')
+        return h
 
 
 class BitcoinZ(EquihashMixin, Coin):
@@ -1467,8 +1558,8 @@ class Monacoin(Coin):
         'electrumx.tamami-foundation.org s t',
         'electrumx2.tamami-foundation.org s t',
         'electrumx3.tamami-foundation.org s t',
-        'electrumx1.monacoin.nl s t',
         'electrumx2.monacoin.nl s t',
+        'electrumx3.monacoin.nl s t',
         'electrumx1.monacoin.ninja s t',
         'electrumx2.monacoin.ninja s t',
         'electrumx2.movsign.info s t',
@@ -1909,6 +2000,14 @@ class Decred(Coin):
         else:
             return Block(raw_block, cls.block_header(raw_block, height), [])
 
+    @classmethod
+    def electrum_header(cls, header, height):
+        h = super().electrum_header(header, height)
+        h['stake_root'] = hash_to_hex_str(h['stake_root'])
+        h['final_state'] = hash_to_hex_str(h['final_state'])
+        h['extra_data'] = hash_to_hex_str(h['extra_data'])
+        return h
+
 
 class DecredTestnet(Decred):
     SHORTNAME = "tDCR"
@@ -1995,6 +2094,13 @@ class Xuez(Coin):
             return xevan_hash.getPoWHash(header[:80])
         else:
             return xevan_hash.getPoWHash(header)
+
+    @classmethod
+    def electrum_header(cls, header, height):
+        h = super().electrum_header(header, height)
+        if h['version'] > 1:
+            h['nAccumulatorCheckpoint'] = hash_to_hex_str(header[80:])
+        return h
 
 
 class Pac(Coin):
@@ -2182,6 +2288,12 @@ class Minexcoin(EquihashMixin, Coin):
         'elex01-ams.turinex.eu s t',
         'eu.minexpool.nl s t'
     ]
+
+    @classmethod
+    def electrum_header(cls, header, height):
+        h = super().electrum_header(header, height)
+        h['solution'] = hash_to_hex_str(header[cls.HEADER_SIZE_NO_SOLUTION:])
+        return h
 
     @classmethod
     def block_header(cls, block, height):

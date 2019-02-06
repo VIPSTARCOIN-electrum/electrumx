@@ -1,5 +1,5 @@
 import setuptools
-version = '1.9.1'
+version = '1.9.3'
 
 setuptools.setup(
     name='electrumX',
