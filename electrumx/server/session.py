@@ -560,36 +560,35 @@ class SessionManager(object):
             hc[hashX] = await self.db.limited_history(hashX, limit=limit)
         return hc[hashX]
 
-    if issubclass(self.env.coin.SESSIONCLS, VIPSTARCOINElectrumX):
-        async def _notify_sessions(self, height, touched, eventlog_touched=None):
-            '''Notify sessions about height changes and touched addresses.'''
-            height_changed = height != self.notified_height
-            if height_changed:
-                await self._refresh_hsub_results(height)
-                # Invalidate our history cache for touched hashXs
-                hc = self.history_cache
-                for hashX in set(hc).intersection(touched):
-                    del hc[hashX]
-                ec = self.eventlog_cache
-                if eventlog_touched is not None:
-                    for hashY in set(ec).intersection(eventlog_touched):
-                        del ec[hashY]
+    async def _notify_sessions(self, height, touched, eventlog_touched=None):
+        '''Notify sessions about height changes and touched addresses.'''
+        height_changed = height != self.notified_height
+        if height_changed:
+            await self._refresh_hsub_results(height)
+            # Invalidate our history cache for touched hashXs
+            hc = self.history_cache
+            for hashX in set(hc).intersection(touched):
+                del hc[hashX]
+            ec = self.eventlog_cache
+            if eventlog_touched is not None:
+                for hashY in set(ec).intersection(eventlog_touched):
+                    del ec[hashY]
 
-            for session in self.sessions:
-                await session.spawn(session.notify, touched, eventlog_touched, height_changed)
-    else:
-        async def _notify_sessions(self, height, touched):
-            '''Notify sessions about height changes and touched addresses.'''
-            height_changed = height != self.notified_height
-            if height_changed:
-                await self._refresh_hsub_results(height)
-                # Invalidate our history cache for touched hashXs
-                hc = self.history_cache
-                for hashX in set(hc).intersection(touched):
-                    del hc[hashX]
+        for session in self.sessions:
+            await session.spawn(session.notify, touched, eventlog_touched, height_changed)
 
-            for session in self.sessions:
-                await session.spawn(session.notify, touched, height_changed)
+    async def _notify_sessions(self, height, touched):
+        '''Notify sessions about height changes and touched addresses.'''
+        height_changed = height != self.notified_height
+        if height_changed:
+            await self._refresh_hsub_results(height)
+            # Invalidate our history cache for touched hashXs
+            hc = self.history_cache
+            for hashX in set(hc).intersection(touched):
+                del hc[hashX]
+
+        for session in self.sessions:
+            await session.spawn(session.notify, touched, height_changed)
 
     def add_session(self, session):
         self.sessions.add(session)
@@ -655,12 +654,10 @@ class SessionBase(RPCSession):
         self._receive_message_orig = self.connection.receive_message
         self.connection.receive_message = self.receive_message
 
-    if issubclass(self.coin.SESSIONCLS, VIPSTARCOINElectrumX):
-        async def notify(self, touched, eventlog_touched, height_changed):
-            pass
-    else:
-        async def notify(self, touched, height_changed):
-            pass
+    async def notify(self, touched, eventlog_touched, height_changed):
+        pass
+    async def notify(self, touched, height_changed):
+        pass
 
     def peer_address_str(self, *, for_log=True):
         '''Returns the peer's IP address and port as a human-readable
