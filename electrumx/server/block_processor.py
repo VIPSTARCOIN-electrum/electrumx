@@ -18,7 +18,6 @@ from functools import partial
 from aiorpcx import TaskGroup, run_in_thread
 
 import electrumx
-import electrumx.server.env as env
 from electrumx.server.daemon import DaemonError
 from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
 from electrumx.lib.util import chunks, class_logger
@@ -35,7 +34,7 @@ class Prefetcher(object):
         self.blocks_event = blocks_event
         self.blocks = []
         # Use eventlog coins
-        if issubclass(env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
+        if issubclass(self.env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
             self.raw_eventlogs = []
         self.caught_up = False
         # Access to fetched_height should be protected by the semaphore

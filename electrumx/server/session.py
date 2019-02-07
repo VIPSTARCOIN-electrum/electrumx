@@ -654,8 +654,9 @@ class SessionBase(RPCSession):
         self._receive_message_orig = self.connection.receive_message
         self.connection.receive_message = self.receive_message
 
-    async def notify(self, touched, eventlog_touched, height_changed):
+    async def notify_eventlog(self, touched, eventlog_touched, height_changed):
         pass
+
     async def notify(self, touched, height_changed):
         pass
 
@@ -1601,7 +1602,7 @@ class VIPSTARCOINElectrumX(ElectrumX):
         self.set_request_handlers(self.PROTOCOL_MIN)
         self.contract_subs = {}  # hashY+topic_name: (hash160, contract_addr, topic)
 
-    async def notify(self, touched, eventlog_touched, height_changed):
+    async def notify_eventlog(self, touched, eventlog_touched, height_changed):
         super().notify(touched, height_changed)
         if eventlog_touched:
             matched = eventlog_touched.intersection(self.contract_subs)
