@@ -27,7 +27,7 @@ from electrumx.server.db import FlushData
 class Prefetcher(object):
     '''Prefetches blocks (in the forward direction only).'''
 
-    def __init__(self, daemon, coin, blocks_event):
+    def __init__(self, daemon, env, coin, blocks_event):
         self.logger = class_logger(__name__, self.__class__.__name__)
         self.daemon = daemon
         self.env = env
