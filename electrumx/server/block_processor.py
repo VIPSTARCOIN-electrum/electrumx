@@ -70,12 +70,11 @@ class Prefetcher(object):
         self.refill_event.set()
         return blocks
 
-    if issubclass(env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
-        def get_prefetched_raw_eventlogs(self):
-            '''Called by block processor when it is processing queued blocks.'''
-            raw_eventlogs = self.raw_eventlogs
-            self.raw_eventlogs = []
-            return raw_eventlogs
+    def get_prefetched_raw_eventlogs(self):
+        '''Called by block processor when it is processing queued blocks.'''
+        raw_eventlogs = self.raw_eventlogs
+        self.raw_eventlogs = []
+        return raw_eventlogs
 
     async def reset_height(self, height):
         '''Reset to prefetch blocks from the block processor's height.
@@ -87,7 +86,7 @@ class Prefetcher(object):
         async with self.semaphore:
             self.blocks.clear()
             # Use eventlog coins
-            if issubclass(env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
+            if issubclass(self.env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
                 self.raw_eventlogs.clear()
             self.cache_size = 0
             self.fetched_height = height
@@ -128,7 +127,7 @@ class Prefetcher(object):
                     self.logger.info('new block height {:,d} hash {}'
                                      .format(first + count-1, hex_hashes[-1]))
                 blocks = await daemon.raw_blocks(hex_hashes)
-                if issubclass(env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
+                if issubclass(self.env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
                     raw_eventlogs = await daemon.searchlogs(first, first+count)
                     if raw_eventlogs is None:
                         raw_eventlogs = []
@@ -148,7 +147,7 @@ class Prefetcher(object):
                 else:
                     self.ave_size = (size + (10 - count) * self.ave_size) // 10
 
-                if issubclass(env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
+                if issubclass(self.env.coin.BLOCK_PROCESSOR, VIPSTARCOINBlockProcessor):
                     self.raw_eventlogs.extend(raw_eventlogs)
                 self.blocks.extend(blocks)
                 self.cache_size += size
