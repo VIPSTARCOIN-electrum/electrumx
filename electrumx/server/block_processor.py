@@ -177,7 +177,7 @@ class BlockProcessor(object):
 
         self.coin = env.coin
         self.blocks_event = asyncio.Event()
-        self.prefetcher = Prefetcher(daemon, env.coin, self.blocks_event)
+        self.prefetcher = Prefetcher(daemon, env, env.coin, self.blocks_event)
         self.logger = class_logger(__name__, self.__class__.__name__)
 
         # Meta
