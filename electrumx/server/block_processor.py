@@ -30,6 +30,7 @@ class Prefetcher(object):
     def __init__(self, daemon, coin, blocks_event):
         self.logger = class_logger(__name__, self.__class__.__name__)
         self.daemon = daemon
+        self.env = env
         self.coin = coin
         self.blocks_event = blocks_event
         self.blocks = []
