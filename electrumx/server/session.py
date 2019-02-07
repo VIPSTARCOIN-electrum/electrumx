@@ -28,7 +28,6 @@ from aiorpcx import (
 import electrumx
 import electrumx.lib.text as text
 import electrumx.lib.util as util
-import electrumx.server.env as env
 from electrumx.lib.hash import (sha256, hash_to_hex_str, hex_str_to_hash,
                                 HASHX_LEN, Base58Error)
 from electrumx.lib.peer import Peer
@@ -561,7 +560,7 @@ class SessionManager(object):
             hc[hashX] = await self.db.limited_history(hashX, limit=limit)
         return hc[hashX]
 
-    if issubclass(env.coin.SESSIONCLS, VIPSTARCOINElectrumX):
+    if issubclass(self.env.coin.SESSIONCLS, VIPSTARCOINElectrumX):
         async def _notify_sessions(self, height, touched, eventlog_touched=None):
             '''Notify sessions about height changes and touched addresses.'''
             height_changed = height != self.notified_height
@@ -613,18 +612,17 @@ class SessionManager(object):
                                f'{self.max_subs:,d} reached')
         self.subs_room -= 1
 
-    if issubclass(env.coin.SESSIONCLS, VIPSTARCOINElectrumX):
-        async def limited_eventlog(self, hashY):
-            '''A caching layer.'''
-            ec = self.eventlog_cache
-            if hashY not in ec:
-                # History DoS limit.  Each element of history is about 99
-                # bytes when encoded as JSON.  This limits resource usage
-                # on bloated history requests, and uses a smaller divisor
-                # so large requests are logged before refusing them.
-                limit = self.env.max_send // 97
-                ec[hashY] = await self.db.limited_eventlog(hashY, limit=limit)
-            return ec[hashY]
+    async def limited_eventlog(self, hashY):
+        '''A caching layer.'''
+        ec = self.eventlog_cache
+        if hashY not in ec:
+            # History DoS limit.  Each element of history is about 99
+            # bytes when encoded as JSON.  This limits resource usage
+            # on bloated history requests, and uses a smaller divisor
+            # so large requests are logged before refusing them.
+            limit = self.env.max_send // 97
+            ec[hashY] = await self.db.limited_eventlog(hashY, limit=limit)
+        return ec[hashY]
 
 class SessionBase(RPCSession):
     '''Base class of ElectrumX JSON sessions.
@@ -657,7 +655,7 @@ class SessionBase(RPCSession):
         self._receive_message_orig = self.connection.receive_message
         self.connection.receive_message = self.receive_message
 
-    if issubclass(env.coin.SESSIONCLS, VIPSTARCOINElectrumX):
+    if issubclass(self.coin.SESSIONCLS, VIPSTARCOINElectrumX):
         async def notify(self, touched, eventlog_touched, height_changed):
             pass
     else:
